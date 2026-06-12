@@ -11,26 +11,43 @@ function AppContent() {
 
   if (loading) {
     return (
-      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
-        <div className="text-slate-400 text-lg animate-pulse">Loading...</div>
+      <div style={{
+        minHeight: "100vh", background: "var(--bg)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+      }}>
+        <div style={{ display: "flex", alignItems: "center", gap: "10px", color: "var(--text-secondary)" }}>
+          <svg width="20" height="20" viewBox="0 0 20 20" fill="none"
+            style={{ animation: "spin 1s linear infinite" }}>
+            <circle cx="10" cy="10" r="8" stroke="currentColor" strokeWidth="2"
+              strokeDasharray="40" strokeDashoffset="20" strokeLinecap="round" />
+          </svg>
+          <style>{`@keyframes spin { to { transform: rotate(360deg) } }`}</style>
+          Loading…
+        </div>
       </div>
     );
   }
 
   if (user) return <Dashboard />;
-
   if (showRegister) return <RegisterPage onSwitchToLogin={() => setShowRegister(false)} />;
-
   return <LoginPage onSwitchToRegister={() => setShowRegister(true)} />;
 }
 
-function App() {
+export default function App() {
   return (
     <AuthProvider>
-      <Toaster position="top-right" />
+      <Toaster
+        position="bottom-center"
+        toastOptions={{
+          style: {
+            background: "var(--text-primary)", color: "#fff",
+            borderRadius: "var(--radius-md)", fontSize: "14px", padding: "10px 16px",
+          },
+          success: { iconTheme: { primary: "#4ade80", secondary: "#fff" } },
+          error: { iconTheme: { primary: "#f87171", secondary: "#fff" } },
+        }}
+      />
       <AppContent />
     </AuthProvider>
   );
 }
-
-export default App;
