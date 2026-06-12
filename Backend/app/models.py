@@ -44,4 +44,4 @@ class OCRChunk(Base):
     content      = Column(Text)
     embedding    = Column(Vector(384))
 
-    document = relationship("OCRDocument", back_populates="chunks")
+    document = relationship("OCRDocument", back_populates="chunks") 

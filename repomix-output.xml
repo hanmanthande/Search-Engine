@@ -46,8 +46,10 @@ Backend/app/config.py
 Backend/app/database.py
 Backend/app/main.py
 Backend/app/models.py
+Backend/app/routes/auth.py
 Backend/app/routes/upload.py
 Backend/app/schemas.py
+Backend/app/services/auth_service.py
 Backend/app/services/chunk_service.py
 Backend/app/services/embedding_service.py
 Backend/app/services/langchain_service.py
@@ -74,9 +76,12 @@ frontend/src/components/Header.jsx
 frontend/src/components/RagChat.jsx
 frontend/src/components/Sidebar.jsx
 frontend/src/components/UploadSection.jsx
+frontend/src/context/AuthContext.jsx
 frontend/src/index.css
 frontend/src/main.jsx
 frontend/src/pages/Dashboard.jsx
+frontend/src/pages/LoginPage.jsx
+frontend/src/pages/RegisterPage.jsx
 frontend/src/services/api.js
 frontend/vite.config.js
 </directory_structure>
@@ -325,501 +330,177 @@ def get_db():
         db.close()
 </file>
 
-<file path="Backend/app/main.py">
-from fastapi import FastAPI
-from fastapi.middleware.cors import CORSMiddleware
-from app.database import Base, engine
-from app.routes.upload import router
-from app.config import ALLOWED_ORIGINS
-
-# Create database tables
-Base.metadata.create_all(bind=engine)
-
-app = FastAPI(title="OCR Document Extractor API")
-
-# CORS configuration
-origins = ALLOWED_ORIGINS
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=origins,
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# Register routes
-app.include_router(router)
-
-
-@app.get("/")
-def health_check():
-    return {
-        "status": "running",
-        "service": "OCR Document Extractor"
-    }
-</file>
-
-<file path="Backend/app/models.py">
-from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime
-from sqlalchemy.orm import relationship
-from sqlalchemy.sql import func
-from pgvector.sqlalchemy import Vector
-from app.database import Base
- 
- 
-class OCRDocument(Base):
-    __tablename__ = "ocr_documents"
- 
-    id          = Column(Integer, primary_key=True, index=True)
-    filename    = Column(String(255), nullable=False)
-    s3_key      = Column(String(512), nullable=False)          # e.g. uploads/uuid.pdf
-    file_size   = Column(Integer, nullable=True)               # bytes
-    mime_type   = Column(String(100), nullable=True)
-    page_count  = Column(Integer, nullable=True)
-    created_at  = Column(DateTime(timezone=True), server_default=func.now())
- 
-    chunks = relationship("OCRChunk", back_populates="document", cascade="all, delete-orphan")
- 
- 
-class OCRChunk(Base):
-    __tablename__ = "ocr_chunks"
- 
-    id           = Column(Integer, primary_key=True, index=True)
-    document_id  = Column(Integer, ForeignKey("ocr_documents.id", ondelete="CASCADE"))
-    page_number  = Column(Integer)
-    chunk_number = Column(Integer)
-    content      = Column(Text)
-    embedding    = Column(Vector(384))
- 
-    document = relationship("OCRDocument", back_populates="chunks")
-</file>
-
-<file path="Backend/app/routes/upload.py">
+<file path="Backend/app/routes/auth.py">
 import logging
-import uuid
-import os
-from typing import Optional
- 
-from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, status
 from sqlalchemy.orm import Session
-from sqlalchemy import text, func
- 
+
 from app.database import get_db
-from app.models import OCRDocument, OCRChunk
+from app.models import User
 from app.schemas import (
-    UploadResponse,
-    SearchResponse,
-    SearchResult,
-    AskResponse,
-    DocumentListResponse,
-    DocumentInfo,
+    UserRegister, UserLogin, UserOut,
+    TokenResponse, TokenRefreshRequest, TokenRefreshResponse,
 )
-from app.services.s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3
-from app.services.ocr_service import extract_text_from_image_bytes, extract_text_from_pdf_bytes
-from app.services.chunk_service import split_text
-from app.services.embedding_service import generate_embedding
-from app.services.rag_service import retrieve_context, retrieve_context_with_metadata
-from app.services.langchain_service import generate_rag_answer
-from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_MB
- 
+from app.services.auth_service import (
+    hash_password, verify_password,
+    create_access_token, create_refresh_token,
+    decode_refresh_token, get_current_user,
+)
+
 logger = logging.getLogger(__name__)
-router = APIRouter(prefix="/api", tags=["documents"])
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# Helper
-# ─────────────────────────────────────────────────────────────────
- 
-def _get_nearby_context(db: Session, document_id: int, chunk_number: int, window: int = 1) -> str:
-    """Fetches the matched chunk plus `window` chunks on each side for richer context."""
-    nearby = (
-        db.query(OCRChunk)
-        .filter(
-            OCRChunk.document_id == document_id,
-            OCRChunk.chunk_number >= max(1, chunk_number - window),
-            OCRChunk.chunk_number <= chunk_number + window,
-        )
-        .order_by(OCRChunk.chunk_number)
-        .all()
+router = APIRouter(prefix="/api/auth", tags=["auth"])
+
+
+@router.post("/register", response_model=TokenResponse, status_code=201)
+def register(payload: UserRegister, db: Session = Depends(get_db)):
+    if db.query(User).filter(User.email == payload.email).first():
+        raise HTTPException(400, "An account with this email already exists.")
+    if db.query(User).filter(User.username == payload.username).first():
+        raise HTTPException(400, "This username is already taken.")
+
+    user = User(
+        email=payload.email,
+        username=payload.username,
+        hashed_password=hash_password(payload.password),
     )
-    return " ".join(c.content for c in nearby)
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# POST /api/upload
-# ─────────────────────────────────────────────────────────────────
- 
-@router.post("/upload", response_model=UploadResponse)
-async def upload_document(
-    file: UploadFile = File(...),
-    db: Session = Depends(get_db),
-):
-    # ── Validate extension ─────────────────────────────────
-    ext = os.path.splitext(file.filename)[1].lower()
-    if ext not in ALLOWED_EXTENSIONS:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Unsupported file type '{ext}'. Allowed: {', '.join(ALLOWED_EXTENSIONS)}",
-        )
- 
-    # ── Read & validate size ───────────────────────────────
-    file_bytes = await file.read()
-    if len(file_bytes) > MAX_UPLOAD_SIZE_BYTES:
-        raise HTTPException(
-            status_code=413,
-            detail=f"File too large. Maximum allowed size is {MAX_UPLOAD_SIZE_MB} MB.",
-        )
- 
-    # ── Determine MIME type ────────────────────────────────
-    content_type = file.content_type or ("application/pdf" if ext == ".pdf" else "image/jpeg")
- 
-    # ── Upload to S3 ───────────────────────────────────────
-    unique_filename = f"{uuid.uuid4()}{ext}"
-    try:
-        s3_key = upload_file_to_s3(file_bytes, unique_filename, content_type)
-    except RuntimeError as e:
-        logger.error("S3 upload error: %s", e)
-        raise HTTPException(status_code=500, detail=str(e))
- 
-    # ── Save document record ───────────────────────────────
-    document = OCRDocument(
-        filename=file.filename,
-        s3_key=s3_key,
-        file_size=len(file_bytes),
-        mime_type=content_type,
-    )
-    db.add(document)
+    db.add(user)
     db.commit()
-    db.refresh(document)
- 
-    # ── OCR + chunk + embed ────────────────────────────────
-    chunk_count = 0
-    try:
-        if ext == ".pdf":
-            pages = extract_text_from_pdf_bytes(file_bytes)
-            document.page_count = len(pages)
- 
-            for page_num, page_text in enumerate(pages, start=1):
-                chunks = split_text(page_text)
-                for chunk_num, chunk in enumerate(chunks, start=1):
-                    if not chunk.strip():
-                        continue
-                    embedding = generate_embedding(chunk)
-                    db.add(OCRChunk(
-                        document_id=document.id,
-                        page_number=page_num,
-                        chunk_number=chunk_num,
-                        content=chunk,
-                        embedding=embedding,
-                    ))
-                    chunk_count += 1
- 
-        else:
-            page_text = extract_text_from_image_bytes(file_bytes)
-            document.page_count = 1
-            chunks = split_text(page_text)
- 
-            for chunk_num, chunk in enumerate(chunks, start=1):
-                if not chunk.strip():
-                    continue
-                embedding = generate_embedding(chunk)
-                db.add(OCRChunk(
-                    document_id=document.id,
-                    page_number=1,
-                    chunk_number=chunk_num,
-                    content=chunk,
-                    embedding=embedding,
-                ))
-                chunk_count += 1
- 
-        db.commit()
- 
-    except Exception as e:
-        # Roll back document record if processing fails
-        db.rollback()
-        try:
-            delete_file_from_s3(s3_key)
-        except Exception:
-            pass
-        logger.error("Processing failed for %s: %s", file.filename, e)
-        raise HTTPException(status_code=500, detail=f"Document processing failed: {e}")
- 
-    logger.info("Processed '%s' → %d chunks", file.filename, chunk_count)
-    return UploadResponse(
-        document_id=document.id,
-        filename=file.filename,
-        s3_key=s3_key,
-        file_size=len(file_bytes),
-        page_count=document.page_count or 1,
-        chunk_count=chunk_count,
-        message=f"Document uploaded and processed successfully ({chunk_count} chunks created).",
+    db.refresh(user)
+
+    token_data = {"sub": str(user.id)}
+    return TokenResponse(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+        user=user,
     )
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# GET /api/search/keyword
-# ─────────────────────────────────────────────────────────────────
- 
-@router.get("/search/keyword", response_model=SearchResponse)
-def keyword_search(
-    query: str = Query(..., min_length=1, max_length=500),
-    limit: int = Query(10, ge=1, le=50),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-):
-    if not query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
- 
-    matches = (
-        db.query(OCRChunk)
-        .join(OCRDocument)
-        .filter(OCRChunk.content.ilike(f"%{query}%"))
-        .offset(offset)
-        .limit(limit)
-        .all()
+
+
+@router.post("/login", response_model=TokenResponse)
+def login(payload: UserLogin, db: Session = Depends(get_db)):
+    user = db.query(User).filter(User.email == payload.email).first()
+    if not user or not verify_password(payload.password, user.hashed_password):
+        raise HTTPException(401, "Invalid email or password.")
+    if not user.is_active:
+        raise HTTPException(403, "Your account has been disabled.")
+
+    token_data = {"sub": str(user.id)}
+    return TokenResponse(
+        access_token=create_access_token(token_data),
+        refresh_token=create_refresh_token(token_data),
+        user=user,
     )
- 
-    results: list[SearchResult] = []
-    seen_contents: set[str] = set()
- 
-    for chunk in matches:
-        if chunk.content in seen_contents:
-            continue
-        seen_contents.add(chunk.content)
- 
-        context = _get_nearby_context(db, chunk.document_id, chunk.chunk_number)
-        results.append(SearchResult(
-            chunk_id=chunk.id,
-            document_id=chunk.document_id,
-            filename=chunk.document.filename,
-            s3_key=chunk.document.s3_key,
-            page=chunk.page_number,
-            chunk_number=chunk.chunk_number,
-            matched_text=chunk.content,
-            context=context,
-        ))
- 
-    return SearchResponse(query=query, results=results, total=len(results))
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# GET /api/search/semantic
-# ─────────────────────────────────────────────────────────────────
- 
-@router.get("/search/semantic", response_model=SearchResponse)
-def semantic_search(
-    query: str = Query(..., min_length=1, max_length=500),
-    limit: int = Query(5, ge=1, le=20),
-    db: Session = Depends(get_db),
-):
-    if not query.strip():
-        raise HTTPException(status_code=400, detail="Query cannot be empty.")
- 
-    try:
-        query_embedding = generate_embedding(query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {e}")
- 
-    try:
-        raw_results = retrieve_context_with_metadata(query_embedding, db, top_k=limit)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
- 
-    results: list[SearchResult] = []
-    seen: set[str] = set()
- 
-    for row in raw_results:
-        if row["content"] in seen:
-            continue
-        seen.add(row["content"])
-        context = _get_nearby_context(db, row["document_id"], row["chunk_number"])
-        results.append(SearchResult(
-            chunk_id=row["chunk_id"],
-            document_id=row["document_id"],
-            filename=row["filename"],
-            s3_key=row["s3_key"],
-            page=row["page"],
-            chunk_number=row["chunk_number"],
-            matched_text=row["content"],
-            context=context,
-            distance=row["distance"],
-        ))
- 
-    return SearchResponse(query=query, results=results, total=len(results))
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# GET /api/ask
-# ─────────────────────────────────────────────────────────────────
- 
-@router.get("/ask", response_model=AskResponse)
-def ask_question(
-    query: str = Query(..., min_length=1, max_length=1000),
-    top_k: int = Query(5, ge=1, le=10),
-    db: Session = Depends(get_db),
-):
-    try:
-        query_embedding = generate_embedding(query)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Embedding generation failed: {e}")
- 
-    try:
-        context_chunks = retrieve_context(query_embedding, db, top_k=top_k)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
- 
-    try:
-        answer = generate_rag_answer(question=query, context_chunks=context_chunks)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
- 
-    return AskResponse(question=query, answer=answer, sources=context_chunks)
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# GET /api/documents
-# ─────────────────────────────────────────────────────────────────
- 
-@router.get("/documents", response_model=DocumentListResponse)
-def list_documents(
-    limit: int = Query(20, ge=1, le=100),
-    offset: int = Query(0, ge=0),
-    db: Session = Depends(get_db),
-):
-    total = db.query(func.count(OCRDocument.id)).scalar()
-    documents = (
-        db.query(OCRDocument)
-        .order_by(OCRDocument.created_at.desc())
-        .offset(offset)
-        .limit(limit)
-        .all()
-    )
- 
-    doc_infos: list[DocumentInfo] = []
-    for doc in documents:
-        chunk_count = db.query(func.count(OCRChunk.id)).filter(OCRChunk.document_id == doc.id).scalar()
-        doc_infos.append(DocumentInfo(
-            id=doc.id,
-            filename=doc.filename,
-            s3_key=doc.s3_key,
-            file_size=doc.file_size,
-            page_count=doc.page_count,
-            chunk_count=chunk_count,
-            created_at=doc.created_at,
-        ))
- 
-    return DocumentListResponse(documents=doc_infos, total=total)
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# GET /api/documents/{document_id}/url
-# ─────────────────────────────────────────────────────────────────
- 
-@router.get("/documents/{document_id}/url")
-def get_document_url(
-    document_id: int,
-    expires_in: int = Query(3600, ge=60, le=86400),
-    db: Session = Depends(get_db),
-):
-    """Returns a temporary presigned S3 URL to view/download the original file."""
-    doc = db.query(OCRDocument).filter(OCRDocument.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found.")
- 
-    try:
-        url = generate_presigned_url(doc.s3_key, expires_in=expires_in)
-    except RuntimeError as e:
-        raise HTTPException(status_code=500, detail=str(e))
- 
-    return {"document_id": document_id, "filename": doc.filename, "url": url, "expires_in": expires_in}
- 
- 
-# ─────────────────────────────────────────────────────────────────
-# DELETE /api/documents/{document_id}
-# ─────────────────────────────────────────────────────────────────
- 
-@router.delete("/documents/{document_id}")
-def delete_document(
-    document_id: int,
-    db: Session = Depends(get_db),
-):
-    doc = db.query(OCRDocument).filter(OCRDocument.id == document_id).first()
-    if not doc:
-        raise HTTPException(status_code=404, detail="Document not found.")
- 
-    s3_key = doc.s3_key
-    db.delete(doc)
-    db.commit()
- 
-    try:
-        delete_file_from_s3(s3_key)
-    except RuntimeError as e:
-        logger.warning("DB record deleted but S3 delete failed for %s: %s", s3_key, e)
- 
-    return {"message": f"Document '{doc.filename}' deleted successfully."}
+
+
+@router.post("/refresh", response_model=TokenRefreshResponse)
+def refresh_token(payload: TokenRefreshRequest, db: Session = Depends(get_db)):
+    token_payload = decode_refresh_token(payload.refresh_token)
+    user_id = token_payload.get("sub")
+    if not user_id:
+        raise HTTPException(401, "Invalid token")
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user or not user.is_active:
+        raise HTTPException(401, "User not found or disabled")
+    return TokenRefreshResponse(access_token=create_access_token({"sub": str(user.id)}))
+
+
+@router.get("/me", response_model=UserOut)
+def get_me(current_user: User = Depends(get_current_user)):
+    return current_user
 </file>
 
-<file path="Backend/app/schemas.py">
-from pydantic import BaseModel
+<file path="Backend/app/services/auth_service.py">
+import os
+import logging
+from datetime import datetime, timedelta, timezone
 from typing import Optional
-from datetime import datetime
- 
- 
-# ── Upload ────────────────────────────────────────────────
-class UploadResponse(BaseModel):
-    document_id: int
-    filename:    str
-    s3_key:      str
-    file_size:   int
-    page_count:  int
-    chunk_count: int
-    message:     str
- 
- 
-# ── Search ────────────────────────────────────────────────
-class SearchResult(BaseModel):
-    chunk_id:     int
-    document_id:  int
-    filename:     str
-    s3_key:       str
-    page:         int
-    chunk_number: int
-    matched_text: str
-    context:      str
-    distance:     Optional[float] = None   # only for semantic search
- 
- 
-class SearchResponse(BaseModel):
-    query:   str
-    results: list[SearchResult]
-    total:   int
- 
- 
-# ── Ask / RAG ─────────────────────────────────────────────
-class AskResponse(BaseModel):
-    question: str
-    answer:   str
-    sources:  list[str]
- 
- 
-# ── Document list ─────────────────────────────────────────
-class DocumentInfo(BaseModel):
-    id:          int
-    filename:    str
-    s3_key:      str
-    file_size:   Optional[int]
-    page_count:  Optional[int]
-    chunk_count: int
-    created_at:  Optional[datetime]
- 
-    class Config:
-        from_attributes = True
- 
- 
-class DocumentListResponse(BaseModel):
-    documents: list[DocumentInfo]
-    total:     int
+
+from jose import JWTError, jwt
+from passlib.context import CryptContext
+from fastapi import Depends, HTTPException, status
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from sqlalchemy.orm import Session
+
+from app.database import get_db
+from app.models import User
+
+logger = logging.getLogger(__name__)
+
+SECRET_KEY                   = os.getenv("JWT_SECRET_KEY", "CHANGE_ME")
+REFRESH_SECRET_KEY           = os.getenv("JWT_REFRESH_SECRET_KEY", "CHANGE_ME_REFRESH")
+ALGORITHM                    = "HS256"
+ACCESS_TOKEN_EXPIRE_MINUTES  = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "60"))
+REFRESH_TOKEN_EXPIRE_DAYS    = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "7"))
+
+pwd_context   = CryptContext(schemes=["bcrypt"], deprecated="auto")
+bearer_scheme = HTTPBearer()
+
+
+def hash_password(plain: str) -> str:
+    return pwd_context.hash(plain)
+
+
+def verify_password(plain: str, hashed: str) -> bool:
+    return pwd_context.verify(plain, hashed)
+
+
+def create_access_token(data: dict, expires_delta: Optional[timedelta] = None) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + (
+        expires_delta or timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+    )
+    to_encode.update({"exp": expire, "type": "access"})
+    return jwt.encode(to_encode, SECRET_KEY, algorithm=ALGORITHM)
+
+
+def create_refresh_token(data: dict) -> str:
+    to_encode = data.copy()
+    expire = datetime.now(timezone.utc) + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS)
+    to_encode.update({"exp": expire, "type": "refresh"})
+    return jwt.encode(to_encode, REFRESH_SECRET_KEY, algorithm=ALGORITHM)
+
+
+def decode_access_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "access":
+            raise JWTError("Wrong token type")
+        return payload
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired access token",
+            headers={"WWW-Authenticate": "Bearer"},
+        ) from e
+
+
+def decode_refresh_token(token: str) -> dict:
+    try:
+        payload = jwt.decode(token, REFRESH_SECRET_KEY, algorithms=[ALGORITHM])
+        if payload.get("type") != "refresh":
+            raise JWTError("Wrong token type")
+        return payload
+    except JWTError as e:
+        raise HTTPException(
+            status_code=status.HTTP_401_UNAUTHORIZED,
+            detail="Invalid or expired refresh token",
+        ) from e
+
+
+def get_current_user(
+    credentials: HTTPAuthorizationCredentials = Depends(bearer_scheme),
+    db: Session = Depends(get_db),
+) -> User:
+    token = credentials.credentials
+    payload = decode_access_token(token)
+    user_id: Optional[int] = payload.get("sub")
+    if user_id is None:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid token payload")
+    user = db.query(User).filter(User.id == int(user_id)).first()
+    if not user:
+        raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="User not found")
+    if not user.is_active:
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Account is disabled")
+    return user
 </file>
 
 <file path="Backend/app/services/chunk_service.py">
@@ -1073,90 +754,6 @@ def extract_text_from_pdf_bytes(pdf_bytes: bytes) -> list[str]:
     return page_texts
 </file>
 
-<file path="Backend/app/services/rag_service.py">
-import logging
-from sqlalchemy.orm import Session
-from sqlalchemy import text
- 
-logger = logging.getLogger(__name__)
- 
- 
-def retrieve_context(
-    query_embedding: list[float],
-    db: Session,
-    top_k: int = 5,
-) -> list[str]:
-    """
-    Retrieves the top-k most semantically similar chunks from pgvector.
-    Returns a list of content strings to be used as RAG context.
-    """
-    sql = text("""
-        SELECT content
-        FROM ocr_chunks
-        ORDER BY embedding <=> CAST(:embedding AS vector)
-        LIMIT :top_k
-    """)
- 
-    try:
-        results = db.execute(
-            sql,
-            {"embedding": str(query_embedding), "top_k": top_k},
-        ).fetchall()
-        return [row.content for row in results]
-    except Exception as e:
-        logger.error("Context retrieval failed: %s", e)
-        raise RuntimeError(f"Vector search failed: {e}") from e
- 
- 
-def retrieve_context_with_metadata(
-    query_embedding: list[float],
-    db: Session,
-    top_k: int = 5,
-) -> list[dict]:
-    """
-    Like retrieve_context, but also returns filename, page, chunk_number, and distance.
-    Used by the /search/semantic endpoint.
-    """
-    sql = text("""
-        SELECT
-            c.id,
-            c.document_id,
-            c.page_number,
-            c.chunk_number,
-            c.content,
-            d.filename,
-            d.s3_key,
-            c.embedding <=> CAST(:embedding AS vector) AS distance
-        FROM ocr_chunks c
-        JOIN ocr_documents d ON c.document_id = d.id
-        ORDER BY c.embedding <=> CAST(:embedding AS vector)
-        LIMIT :top_k
-    """)
- 
-    try:
-        rows = db.execute(
-            sql,
-            {"embedding": str(query_embedding), "top_k": top_k},
-        ).fetchall()
- 
-        return [
-            {
-                "chunk_id":     row.id,
-                "document_id":  row.document_id,
-                "filename":     row.filename,
-                "s3_key":       row.s3_key,
-                "page":         row.page_number,
-                "chunk_number": row.chunk_number,
-                "content":      row.content,
-                "distance":     float(row.distance),
-            }
-            for row in rows
-        ]
-    except Exception as e:
-        logger.error("Semantic search with metadata failed: %s", e)
-        raise RuntimeError(f"Semantic search failed: {e}") from e
-</file>
-
 <file path="Backend/app/services/s3_service.py">
 import logging
 import boto3
@@ -1248,39 +845,6 @@ def delete_file_from_s3(s3_key: str) -> None:
     except ClientError as e:
         logger.error("S3 delete failed for %s: %s", s3_key, e)
         raise RuntimeError(f"S3 delete failed: {e.response['Error']['Message']}")
-</file>
-
-<file path="Backend/requirements.txt">
-fastapi==0.115.12
-uvicorn[standard]==0.34.2
-
-sqlalchemy==2.0.40
-psycopg2-binary==2.9.10
-pgvector==0.4.1
-
-python-dotenv==1.1.0
-python-multipart==0.0.20
-
-boto3==1.38.23
-botocore==1.38.23
-
-pillow==11.2.1
-pytesseract==0.3.13
-pdf2image==1.17.0
-
-sentence-transformers==4.1.0
-transformers==4.52.3
-torch==2.7.0
-
-langchain==0.3.25
-langchain-core==0.3.63
-langchain-groq==0.3.2
-
-numpy==2.2.6
-pydantic==2.11.5
-
-pytest==8.3.5
-httpx==0.28.1
 </file>
 
 <file path="Backend/tests/test_sample.py">
@@ -1635,22 +1199,6 @@ If you are developing a production application, we recommend using TypeScript wi
 }
 </file>
 
-<file path="frontend/src/App.jsx">
-import Dashboard from "./pages/Dashboard";
-import { Toaster } from "react-hot-toast";
-
-function App() {
-  return (
-    <>
-      <Toaster position="top-right" />
-      <Dashboard />
-    </>
-  );
-}
-
-export default App;
-</file>
-
 <file path="frontend/src/assets/react.svg">
 <svg xmlns="http://www.w3.org/2000/svg" xmlns:xlink="http://www.w3.org/1999/xlink" aria-hidden="true" role="img" class="iconify iconify--logos" width="35.93" height="32" preserveAspectRatio="xMidYMid meet" viewBox="0 0 256 228"><path fill="#00D8FF" d="M210.483 73.824a171.49 171.49 0 0 0-8.24-2.597c.465-1.9.893-3.777 1.273-5.621c6.238-30.281 2.16-54.676-11.769-62.708c-13.355-7.7-35.196.329-57.254 19.526a171.23 171.23 0 0 0-6.375 5.848a155.866 155.866 0 0 0-4.241-3.917C100.759 3.829 77.587-4.822 63.673 3.233C50.33 10.957 46.379 33.89 51.995 62.588a170.974 170.974 0 0 0 1.892 8.48c-3.28.932-6.445 1.924-9.474 2.98C17.309 83.498 0 98.307 0 113.668c0 15.865 18.582 31.778 46.812 41.427a145.52 145.52 0 0 0 6.921 2.165a167.467 167.467 0 0 0-2.01 9.138c-5.354 28.2-1.173 50.591 12.134 58.266c13.744 7.926 36.812-.22 59.273-19.855a145.567 145.567 0 0 0 5.342-4.923a168.064 168.064 0 0 0 6.92 6.314c21.758 18.722 43.246 26.282 56.54 18.586c13.731-7.949 18.194-32.003 12.4-61.268a145.016 145.016 0 0 0-1.535-6.842c1.62-.48 3.21-.974 4.76-1.488c29.348-9.723 48.443-25.443 48.443-41.52c0-15.417-17.868-30.326-45.517-39.844Zm-6.365 70.984c-1.4.463-2.836.91-4.3 1.345c-3.24-10.257-7.612-21.163-12.963-32.432c5.106-11 9.31-21.767 12.459-31.957c2.619.758 5.16 1.557 7.61 2.4c23.69 8.156 38.14 20.213 38.14 29.504c0 9.896-15.606 22.743-40.946 31.14Zm-10.514 20.834c2.562 12.94 2.927 24.64 1.23 33.787c-1.524 8.219-4.59 13.698-8.382 15.893c-8.067 4.67-25.32-1.4-43.927-17.412a156.726 156.726 0 0 1-6.437-5.87c7.214-7.889 14.423-17.06 21.459-27.246c12.376-1.098 24.068-2.894 34.671-5.345a134.17 134.17 0 0 1 1.386 6.193ZM87.276 214.515c-7.882 2.783-14.16 2.863-17.955.675c-8.075-4.657-11.432-22.636-6.853-46.752a156.923 156.923 0 0 1 1.869-8.499c10.486 2.32 22.093 3.988 34.498 4.994c7.084 9.967 14.501 19.128 21.976 27.15a134.668 134.668 0 0 1-4.877 4.492c-9.933 8.682-19.886 14.842-28.658 17.94ZM50.35 144.747c-12.483-4.267-22.792-9.812-29.858-15.863c-6.35-5.437-9.555-10.836-9.555-15.216c0-9.322 13.897-21.212 37.076-29.293c2.813-.98 5.757-1.905 8.812-2.773c3.204 10.42 7.406 21.315 12.477 32.332c-5.137 11.18-9.399 22.249-12.634 32.792a134.718 134.718 0 0 1-6.318-1.979Zm12.378-84.26c-4.811-24.587-1.616-43.134 6.425-47.789c8.564-4.958 27.502 2.111 47.463 19.835a144.318 144.318 0 0 1 3.841 3.545c-7.438 7.987-14.787 17.08-21.808 26.988c-12.04 1.116-23.565 2.908-34.161 5.309a160.342 160.342 0 0 1-1.76-7.887Zm110.427 27.268a347.8 347.8 0 0 0-7.785-12.803c8.168 1.033 15.994 2.404 23.343 4.08c-2.206 7.072-4.956 14.465-8.193 22.045a381.151 381.151 0 0 0-7.365-13.322Zm-45.032-43.861c5.044 5.465 10.096 11.566 15.065 18.186a322.04 322.04 0 0 0-30.257-.006c4.974-6.559 10.069-12.652 15.192-18.18ZM82.802 87.83a323.167 323.167 0 0 0-7.227 13.238c-3.184-7.553-5.909-14.98-8.134-22.152c7.304-1.634 15.093-2.97 23.209-3.984a321.524 321.524 0 0 0-7.848 12.897Zm8.081 65.352c-8.385-.936-16.291-2.203-23.593-3.793c2.26-7.3 5.045-14.885 8.298-22.6a321.187 321.187 0 0 0 7.257 13.246c2.594 4.48 5.28 8.868 8.038 13.147Zm37.542 31.03c-5.184-5.592-10.354-11.779-15.403-18.433c4.902.192 9.899.29 14.978.29c5.218 0 10.376-.117 15.453-.343c-4.985 6.774-10.018 12.97-15.028 18.486Zm52.198-57.817c3.422 7.8 6.306 15.345 8.596 22.52c-7.422 1.694-15.436 3.058-23.88 4.071a382.417 382.417 0 0 0 7.859-13.026a347.403 347.403 0 0 0 7.425-13.565Zm-16.898 8.101a358.557 358.557 0 0 1-12.281 19.815a329.4 329.4 0 0 1-23.444.823c-7.967 0-15.716-.248-23.178-.732a310.202 310.202 0 0 1-12.513-19.846h.001a307.41 307.41 0 0 1-10.923-20.627a310.278 310.278 0 0 1 10.89-20.637l-.001.001a307.318 307.318 0 0 1 12.413-19.761c7.613-.576 15.42-.876 23.31-.876H128c7.926 0 15.743.303 23.354.883a329.357 329.357 0 0 1 12.335 19.695a358.489 358.489 0 0 1 11.036 20.54a329.472 329.472 0 0 1-11 20.722Zm22.56-122.124c8.572 4.944 11.906 24.881 6.52 51.026c-.344 1.668-.73 3.367-1.15 5.09c-10.622-2.452-22.155-4.275-34.23-5.408c-7.034-10.017-14.323-19.124-21.64-27.008a160.789 160.789 0 0 1 5.888-5.4c18.9-16.447 36.564-22.941 44.612-18.3ZM128 90.808c12.625 0 22.86 10.235 22.86 22.86s-10.235 22.86-22.86 22.86s-22.86-10.235-22.86-22.86s10.235-22.86 22.86-22.86Z"></path></svg>
 </file>
@@ -1738,28 +1286,6 @@ function DocumentsPanel() {
 }
 
 export default DocumentsPanel;
-</file>
-
-<file path="frontend/src/components/Header.jsx">
-function Header() {
-  return (
-    <div className="bg-slate-900 border-b border-slate-800 px-6 py-4 flex items-center justify-between">
-
-      <div>
-        <h1 className="text-2xl font-bold">
-          AI RAG Dashboard
-        </h1>
-
-        <p className="text-slate-400 text-sm mt-1">
-          Upload documents and ask AI questions
-        </p>
-      </div>
-
-    </div>
-  );
-}
-
-export default Header;
 </file>
 
 <file path="frontend/src/components/RagChat.jsx">
@@ -1947,6 +1473,73 @@ function UploadSection() {
 export default UploadSection;
 </file>
 
+<file path="frontend/src/context/AuthContext.jsx">
+import { createContext, useContext, useState, useEffect, useCallback } from "react";
+import API from "../services/api";
+
+const AuthContext = createContext(null);
+
+export function AuthProvider({ children }) {
+  const [user, setUser]       = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const token = localStorage.getItem("access_token");
+    if (!token) { setLoading(false); return; }
+
+    API.get("/auth/me")
+      .then((res) => setUser(res.data))
+      .catch(() => {
+        const refresh = localStorage.getItem("refresh_token");
+        if (!refresh) { clearTokens(); setLoading(false); return; }
+
+        API.post("/auth/refresh", { refresh_token: refresh })
+          .then((res) => { localStorage.setItem("access_token", res.data.access_token); return API.get("/auth/me"); })
+          .then((res) => setUser(res.data))
+          .catch(() => clearTokens())
+          .finally(() => setLoading(false));
+      })
+      .finally(() => setLoading(false));
+  }, []);
+
+  const clearTokens = () => {
+    localStorage.removeItem("access_token");
+    localStorage.removeItem("refresh_token");
+    setUser(null);
+  };
+
+  const register = useCallback(async (email, username, password) => {
+    const res = await API.post("/auth/register", { email, username, password });
+    localStorage.setItem("access_token", res.data.access_token);
+    localStorage.setItem("refresh_token", res.data.refresh_token);
+    setUser(res.data.user);
+    return res.data;
+  }, []);
+
+  const login = useCallback(async (email, password) => {
+    const res = await API.post("/auth/login", { email, password });
+    localStorage.setItem("access_token", res.data.access_token);
+    localStorage.setItem("refresh_token", res.data.refresh_token);
+    setUser(res.data.user);
+    return res.data;
+  }, []);
+
+  const logout = useCallback(() => clearTokens(), []);
+
+  return (
+    <AuthContext.Provider value={{ user, loading, login, register, logout }}>
+      {children}
+    </AuthContext.Provider>
+  );
+}
+
+export function useAuth() {
+  const ctx = useContext(AuthContext);
+  if (!ctx) throw new Error("useAuth must be inside <AuthProvider>");
+  return ctx;
+}
+</file>
+
 <file path="frontend/src/index.css">
 @import "tailwindcss";
 
@@ -2025,14 +1618,176 @@ function Dashboard() {
 export default Dashboard;
 </file>
 
-<file path="frontend/src/services/api.js">
-import axios from "axios";
+<file path="frontend/src/pages/LoginPage.jsx">
+import { useState } from "react";
+import { useAuth } from "../context/AuthContext";
+import toast from "react-hot-toast";
 
-const API = axios.create({
-  baseURL: import.meta.env.VITE_API_URL,
-});
+function LoginPage({ onSwitchToRegister }) {
+  const { login } = useAuth();
+  const [form, setForm]       = useState({ email: "", password: "" });
+  const [loading, setLoading] = useState(false);
 
-export default API;
+  const handleChange = (e) => setForm((p) => ({ ...p, [e.target.name]: e.target.value }));
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    try {
+      setLoading(true);
+      await login(form.email, form.password);
+      toast.success("Welcome back!");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Login failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
+      <div className="w-full max-w-md">
+
+        <div className="text-center mb-8">
+          <div className="text-4xl font-bold text-blue-500 mb-2">AI</div>
+          <h1 className="text-2xl font-bold text-white">Welcome back</h1>
+          <p className="text-slate-400 mt-1">Sign in to your RAG Dashboard</p>
+        </div>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8">
+          <form onSubmit={handleSubmit} className="space-y-5">
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Email</label>
+              <input
+                type="email" name="email" value={form.email} onChange={handleChange}
+                placeholder="you@example.com" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition"
+              />
+            </div>
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Password</label>
+              <input
+                type="password" name="password" value={form.password} onChange={handleChange}
+                placeholder="••••••••" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition"
+              />
+            </div>
+
+            <button
+              type="submit" disabled={loading}
+              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl py-3 font-semibold transition"
+            >
+              {loading ? "Signing in..." : "Sign In"}
+            </button>
+
+          </form>
+        </div>
+
+        <p className="text-center text-slate-500 mt-5 text-sm">
+          Don't have an account?{" "}
+          <button onClick={onSwitchToRegister} className="text-blue-400 hover:text-blue-300 font-medium">
+            Create one
+          </button>
+        </p>
+
+      </div>
+    </div>
+  );
+}
+
+export default LoginPage;
+</file>
+
+<file path="frontend/src/pages/RegisterPage.jsx">
+import { useState } from "react";
+import { useAuth } from "../context/AuthContext";
+import toast from "react-hot-toast";
+
+function RegisterPage({ onSwitchToLogin }) {
+  const { register } = useAuth();
+  const [form, setForm]       = useState({ email: "", username: "", password: "", confirm: "" });
+  const [loading, setLoading] = useState(false);
+
+  const handleChange = (e) => setForm((p) => ({ ...p, [e.target.name]: e.target.value }));
+
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+    if (form.password !== form.confirm) { toast.error("Passwords do not match"); return; }
+    if (form.password.length < 6) { toast.error("Password must be at least 6 characters"); return; }
+    try {
+      setLoading(true);
+      await register(form.email, form.username, form.password);
+      toast.success("Account created! Welcome 🎉");
+    } catch (err) {
+      toast.error(err.response?.data?.detail || "Registration failed");
+    } finally {
+      setLoading(false);
+    }
+  };
+
+  return (
+    <div className="min-h-screen bg-slate-950 flex items-center justify-center px-4">
+      <div className="w-full max-w-md">
+
+        <div className="text-center mb-8">
+          <div className="text-4xl font-bold text-blue-500 mb-2">AI</div>
+          <h1 className="text-2xl font-bold text-white">Create an account</h1>
+          <p className="text-slate-400 mt-1">Start using your RAG Dashboard</p>
+        </div>
+
+        <div className="bg-slate-900 border border-slate-800 rounded-2xl p-8">
+          <form onSubmit={handleSubmit} className="space-y-5">
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Email</label>
+              <input type="email" name="email" value={form.email} onChange={handleChange}
+                placeholder="you@example.com" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition" />
+            </div>
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Username</label>
+              <input type="text" name="username" value={form.username} onChange={handleChange}
+                placeholder="johndoe" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition" />
+            </div>
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Password</label>
+              <input type="password" name="password" value={form.password} onChange={handleChange}
+                placeholder="Min 6 characters" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition" />
+            </div>
+
+            <div>
+              <label className="block text-sm text-slate-400 mb-1.5">Confirm Password</label>
+              <input type="password" name="confirm" value={form.confirm} onChange={handleChange}
+                placeholder="••••••••" required
+                className="w-full bg-slate-800 border border-slate-700 rounded-xl px-4 py-3 text-white outline-none focus:border-blue-500 transition" />
+            </div>
+
+            <button type="submit" disabled={loading}
+              className="w-full bg-blue-600 hover:bg-blue-500 disabled:opacity-50 text-white rounded-xl py-3 font-semibold transition">
+              {loading ? "Creating account..." : "Create Account"}
+            </button>
+
+          </form>
+        </div>
+
+        <p className="text-center text-slate-500 mt-5 text-sm">
+          Already have an account?{" "}
+          <button onClick={onSwitchToLogin} className="text-blue-400 hover:text-blue-300 font-medium">
+            Sign in
+          </button>
+        </p>
+
+      </div>
+    </div>
+  );
+}
+
+export default RegisterPage;
 </file>
 
 <file path="frontend/vite.config.js">
@@ -2046,6 +1801,745 @@ export default defineConfig({
     tailwindcss(),
   ],
 })
+</file>
+
+<file path="Backend/app/main.py">
+from fastapi import FastAPI
+from fastapi.middleware.cors import CORSMiddleware
+from app.database import Base, engine
+from app.routes.upload import router as upload_router
+from app.routes.auth import router as auth_router
+from app.config import ALLOWED_ORIGINS
+
+Base.metadata.create_all(bind=engine)
+
+app = FastAPI(title="OCR Document Extractor API")
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=ALLOWED_ORIGINS,
+    allow_credentials=True,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+app.include_router(auth_router)    # /api/auth/*
+app.include_router(upload_router)  # /api/*
+
+
+@app.get("/")
+def health_check():
+    return {"status": "running", "service": "OCR Document Extractor"}
+</file>
+
+<file path="Backend/app/models.py">
+from sqlalchemy import Column, Integer, String, Text, ForeignKey, DateTime, Boolean
+from sqlalchemy.orm import relationship
+from sqlalchemy.sql import func
+from pgvector.sqlalchemy import Vector
+from app.database import Base
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id              = Column(Integer, primary_key=True, index=True)
+    email           = Column(String(255), unique=True, nullable=False, index=True)
+    username        = Column(String(100), unique=True, nullable=False, index=True)
+    hashed_password = Column(String(255), nullable=False)
+    is_active       = Column(Boolean, default=True)
+    created_at      = Column(DateTime(timezone=True), server_default=func.now())
+
+    documents = relationship("OCRDocument", back_populates="owner", cascade="all, delete-orphan")
+
+
+class OCRDocument(Base):
+    __tablename__ = "ocr_documents"
+
+    id         = Column(Integer, primary_key=True, index=True)
+    filename   = Column(String(255), nullable=False)
+    s3_key     = Column(String(512), nullable=False)
+    file_size  = Column(Integer, nullable=True)
+    mime_type  = Column(String(100), nullable=True)
+    page_count = Column(Integer, nullable=True)
+    created_at = Column(DateTime(timezone=True), server_default=func.now())
+    owner_id   = Column(Integer, ForeignKey("users.id", ondelete="CASCADE"), nullable=True)
+
+    owner  = relationship("User", back_populates="documents")
+    chunks = relationship("OCRChunk", back_populates="document", cascade="all, delete-orphan")
+
+
+class OCRChunk(Base):
+    __tablename__ = "ocr_chunks"
+
+    id           = Column(Integer, primary_key=True, index=True)
+    document_id  = Column(Integer, ForeignKey("ocr_documents.id", ondelete="CASCADE"))
+    page_number  = Column(Integer)
+    chunk_number = Column(Integer)
+    content      = Column(Text)
+    embedding    = Column(Vector(384))
+
+    document = relationship("OCRDocument", back_populates="chunks")
+</file>
+
+<file path="Backend/app/routes/upload.py">
+import logging
+import uuid
+import os
+from typing import Optional
+
+from fastapi import APIRouter, UploadFile, File, HTTPException, Depends, Query
+from sqlalchemy.orm import Session
+from sqlalchemy import text, func
+
+from app.database import get_db
+from app.models import OCRDocument, OCRChunk, User
+from app.schemas import (
+    UploadResponse, SearchResponse, SearchResult,
+    AskResponse, DocumentListResponse, DocumentInfo,
+)
+from app.services.s3_service import upload_file_to_s3, generate_presigned_url, delete_file_from_s3
+from app.services.ocr_service import extract_text_from_image_bytes, extract_text_from_pdf_bytes
+from app.services.chunk_service import split_text
+from app.services.embedding_service import generate_embedding
+from app.services.rag_service import retrieve_context, retrieve_context_with_metadata
+from app.services.langchain_service import generate_rag_answer
+from app.services.auth_service import get_current_user
+from app.config import ALLOWED_EXTENSIONS, MAX_UPLOAD_SIZE_BYTES, MAX_UPLOAD_SIZE_MB
+
+logger = logging.getLogger(__name__)
+router = APIRouter(prefix="/api", tags=["documents"])
+
+
+def _get_nearby_context(db, document_id, chunk_number, window=1):
+    nearby = (
+        db.query(OCRChunk)
+        .filter(
+            OCRChunk.document_id == document_id,
+            OCRChunk.chunk_number >= max(1, chunk_number - window),
+            OCRChunk.chunk_number <= chunk_number + window,
+        )
+        .order_by(OCRChunk.chunk_number)
+        .all()
+    )
+    return " ".join(c.content for c in nearby)
+
+
+def _user_docs(db, user):
+    return db.query(OCRDocument).filter(OCRDocument.owner_id == user.id)
+
+
+@router.post("/upload", response_model=UploadResponse)
+async def upload_document(
+    file: UploadFile = File(...),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    ext = os.path.splitext(file.filename)[1].lower()
+    if ext not in ALLOWED_EXTENSIONS:
+        raise HTTPException(400, f"Unsupported file type '{ext}'.")
+
+    file_bytes = await file.read()
+    if len(file_bytes) > MAX_UPLOAD_SIZE_BYTES:
+        raise HTTPException(413, f"File too large. Max {MAX_UPLOAD_SIZE_MB} MB.")
+
+    content_type = file.content_type or ("application/pdf" if ext == ".pdf" else "image/jpeg")
+    unique_filename = f"{uuid.uuid4()}{ext}"
+
+    try:
+        s3_key = upload_file_to_s3(file_bytes, unique_filename, content_type)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    document = OCRDocument(
+        filename=file.filename,
+        s3_key=s3_key,
+        file_size=len(file_bytes),
+        mime_type=content_type,
+        owner_id=current_user.id,
+    )
+    db.add(document)
+    db.commit()
+    db.refresh(document)
+
+    chunk_count = 0
+    try:
+        if ext == ".pdf":
+            pages = extract_text_from_pdf_bytes(file_bytes)
+            document.page_count = len(pages)
+            for page_num, page_text in enumerate(pages, start=1):
+                for chunk_num, chunk in enumerate(split_text(page_text), start=1):
+                    if not chunk.strip():
+                        continue
+                    db.add(OCRChunk(
+                        document_id=document.id, page_number=page_num,
+                        chunk_number=chunk_num, content=chunk,
+                        embedding=generate_embedding(chunk),
+                    ))
+                    chunk_count += 1
+        else:
+            page_text = extract_text_from_image_bytes(file_bytes)
+            document.page_count = 1
+            for chunk_num, chunk in enumerate(split_text(page_text), start=1):
+                if not chunk.strip():
+                    continue
+                db.add(OCRChunk(
+                    document_id=document.id, page_number=1,
+                    chunk_number=chunk_num, content=chunk,
+                    embedding=generate_embedding(chunk),
+                ))
+                chunk_count += 1
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        try:
+            delete_file_from_s3(s3_key)
+        except Exception:
+            pass
+        raise HTTPException(500, f"Document processing failed: {e}")
+
+    return UploadResponse(
+        document_id=document.id, filename=file.filename, s3_key=s3_key,
+        file_size=len(file_bytes), page_count=document.page_count or 1,
+        chunk_count=chunk_count,
+        message=f"Document uploaded and processed successfully ({chunk_count} chunks created).",
+    )
+
+
+@router.get("/search/keyword", response_model=SearchResponse)
+def keyword_search(
+    query: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(10, ge=1, le=50),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    matches = (
+        db.query(OCRChunk).join(OCRDocument)
+        .filter(OCRDocument.owner_id == current_user.id, OCRChunk.content.ilike(f"%{query}%"))
+        .offset(offset).limit(limit).all()
+    )
+    results, seen = [], set()
+    for chunk in matches:
+        if chunk.content in seen:
+            continue
+        seen.add(chunk.content)
+        results.append(SearchResult(
+            chunk_id=chunk.id, document_id=chunk.document_id,
+            filename=chunk.document.filename, s3_key=chunk.document.s3_key,
+            page=chunk.page_number, chunk_number=chunk.chunk_number,
+            matched_text=chunk.content,
+            context=_get_nearby_context(db, chunk.document_id, chunk.chunk_number),
+        ))
+    return SearchResponse(query=query, results=results, total=len(results))
+
+
+@router.get("/search/semantic", response_model=SearchResponse)
+def semantic_search(
+    query: str = Query(..., min_length=1, max_length=500),
+    limit: int = Query(5, ge=1, le=20),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        query_embedding = generate_embedding(query)
+    except Exception as e:
+        raise HTTPException(500, f"Embedding generation failed: {e}")
+
+    try:
+        raw_results = retrieve_context_with_metadata(query_embedding, db, top_k=limit, owner_id=current_user.id)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    results, seen = [], set()
+    for row in raw_results:
+        if row["content"] in seen:
+            continue
+        seen.add(row["content"])
+        results.append(SearchResult(
+            chunk_id=row["chunk_id"], document_id=row["document_id"],
+            filename=row["filename"], s3_key=row["s3_key"],
+            page=row["page"], chunk_number=row["chunk_number"],
+            matched_text=row["content"],
+            context=_get_nearby_context(db, row["document_id"], row["chunk_number"]),
+            distance=row["distance"],
+        ))
+    return SearchResponse(query=query, results=results, total=len(results))
+
+
+@router.get("/ask", response_model=AskResponse)
+def ask_question(
+    query: str = Query(..., min_length=1, max_length=1000),
+    top_k: int = Query(5, ge=1, le=10),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    try:
+        query_embedding = generate_embedding(query)
+    except Exception as e:
+        raise HTTPException(500, f"Embedding generation failed: {e}")
+
+    try:
+        context_chunks = retrieve_context(query_embedding, db, top_k=top_k, owner_id=current_user.id)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    try:
+        answer = generate_rag_answer(question=query, context_chunks=context_chunks)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+
+    return AskResponse(question=query, answer=answer, sources=context_chunks)
+
+
+@router.get("/documents", response_model=DocumentListResponse)
+def list_documents(
+    limit: int = Query(20, ge=1, le=100),
+    offset: int = Query(0, ge=0),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    base_q = _user_docs(db, current_user)
+    total = base_q.with_entities(func.count(OCRDocument.id)).scalar()
+    documents = base_q.order_by(OCRDocument.created_at.desc()).offset(offset).limit(limit).all()
+
+    doc_infos = []
+    for doc in documents:
+        chunk_count = db.query(func.count(OCRChunk.id)).filter(OCRChunk.document_id == doc.id).scalar()
+        doc_infos.append(DocumentInfo(
+            id=doc.id, filename=doc.filename, s3_key=doc.s3_key,
+            file_size=doc.file_size, page_count=doc.page_count,
+            chunk_count=chunk_count, created_at=doc.created_at,
+        ))
+    return DocumentListResponse(documents=doc_infos, total=total)
+
+
+@router.get("/documents/{document_id}/url")
+def get_document_url(
+    document_id: int,
+    expires_in: int = Query(3600, ge=60, le=86400),
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = _user_docs(db, current_user).filter(OCRDocument.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found.")
+    try:
+        url = generate_presigned_url(doc.s3_key, expires_in=expires_in)
+    except RuntimeError as e:
+        raise HTTPException(500, str(e))
+    return {"document_id": document_id, "filename": doc.filename, "url": url, "expires_in": expires_in}
+
+
+@router.delete("/documents/{document_id}")
+def delete_document(
+    document_id: int,
+    db: Session = Depends(get_db),
+    current_user: User = Depends(get_current_user),
+):
+    doc = _user_docs(db, current_user).filter(OCRDocument.id == document_id).first()
+    if not doc:
+        raise HTTPException(404, "Document not found.")
+    s3_key = doc.s3_key
+    db.delete(doc)
+    db.commit()
+    try:
+        delete_file_from_s3(s3_key)
+    except RuntimeError as e:
+        logger.warning("S3 delete failed for %s: %s", s3_key, e)
+    return {"message": f"Document '{doc.filename}' deleted successfully."}
+</file>
+
+<file path="Backend/app/schemas.py">
+from pydantic import BaseModel, EmailStr, field_validator
+from typing import Optional
+from datetime import datetime
+
+
+# ── Auth ──────────────────────────────────────────────────
+class UserRegister(BaseModel):
+    email:    EmailStr
+    username: str
+    password: str
+
+    @field_validator("username")
+    @classmethod
+    def username_alphanumeric(cls, v: str) -> str:
+        v = v.strip()
+        if len(v) < 3:
+            raise ValueError("Username must be at least 3 characters")
+        if len(v) > 50:
+            raise ValueError("Username must be at most 50 characters")
+        return v
+
+    @field_validator("password")
+    @classmethod
+    def password_strength(cls, v: str) -> str:
+        if len(v) < 6:
+            raise ValueError("Password must be at least 6 characters")
+        return v
+
+
+class UserLogin(BaseModel):
+    email:    EmailStr
+    password: str
+
+
+class UserOut(BaseModel):
+    id:         int
+    email:      str
+    username:   str
+    is_active:  bool
+    created_at: Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class TokenResponse(BaseModel):
+    access_token:  str
+    refresh_token: str
+    token_type:    str = "bearer"
+    user:          UserOut
+
+
+class TokenRefreshRequest(BaseModel):
+    refresh_token: str
+
+
+class TokenRefreshResponse(BaseModel):
+    access_token: str
+    token_type:   str = "bearer"
+
+
+# ── Upload ────────────────────────────────────────────────
+class UploadResponse(BaseModel):
+    document_id: int
+    filename:    str
+    s3_key:      str
+    file_size:   int
+    page_count:  int
+    chunk_count: int
+    message:     str
+
+
+# ── Search ────────────────────────────────────────────────
+class SearchResult(BaseModel):
+    chunk_id:     int
+    document_id:  int
+    filename:     str
+    s3_key:       str
+    page:         int
+    chunk_number: int
+    matched_text: str
+    context:      str
+    distance:     Optional[float] = None
+
+
+class SearchResponse(BaseModel):
+    query:   str
+    results: list[SearchResult]
+    total:   int
+
+
+# ── Ask / RAG ─────────────────────────────────────────────
+class AskResponse(BaseModel):
+    question: str
+    answer:   str
+    sources:  list[str]
+
+
+# ── Document list ─────────────────────────────────────────
+class DocumentInfo(BaseModel):
+    id:          int
+    filename:    str
+    s3_key:      str
+    file_size:   Optional[int]
+    page_count:  Optional[int]
+    chunk_count: int
+    created_at:  Optional[datetime]
+
+    class Config:
+        from_attributes = True
+
+
+class DocumentListResponse(BaseModel):
+    documents: list[DocumentInfo]
+    total:     int
+</file>
+
+<file path="Backend/app/services/rag_service.py">
+import logging
+from typing import Optional
+from sqlalchemy.orm import Session
+from sqlalchemy import text
+
+logger = logging.getLogger(__name__)
+
+
+def retrieve_context(
+    query_embedding: list[float],
+    db: Session,
+    top_k: int = 5,
+    owner_id: Optional[int] = None,
+) -> list[str]:
+    if owner_id is not None:
+        sql = text("""
+            SELECT c.content
+            FROM ocr_chunks c
+            JOIN ocr_documents d ON c.document_id = d.id
+            WHERE d.owner_id = :owner_id
+            ORDER BY c.embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+        """)
+        params = {"embedding": str(query_embedding), "top_k": top_k, "owner_id": owner_id}
+    else:
+        sql = text("""
+            SELECT content FROM ocr_chunks
+            ORDER BY embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+        """)
+        params = {"embedding": str(query_embedding), "top_k": top_k}
+
+    try:
+        results = db.execute(sql, params).fetchall()
+        return [row.content for row in results]
+    except Exception as e:
+        logger.error("Context retrieval failed: %s", e)
+        raise RuntimeError(f"Vector search failed: {e}") from e
+
+
+def retrieve_context_with_metadata(
+    query_embedding: list[float],
+    db: Session,
+    top_k: int = 5,
+    owner_id: Optional[int] = None,
+) -> list[dict]:
+    if owner_id is not None:
+        sql = text("""
+            SELECT c.id, c.document_id, c.page_number, c.chunk_number, c.content,
+                   d.filename, d.s3_key,
+                   c.embedding <=> CAST(:embedding AS vector) AS distance
+            FROM ocr_chunks c
+            JOIN ocr_documents d ON c.document_id = d.id
+            WHERE d.owner_id = :owner_id
+            ORDER BY c.embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+        """)
+        params = {"embedding": str(query_embedding), "top_k": top_k, "owner_id": owner_id}
+    else:
+        sql = text("""
+            SELECT c.id, c.document_id, c.page_number, c.chunk_number, c.content,
+                   d.filename, d.s3_key,
+                   c.embedding <=> CAST(:embedding AS vector) AS distance
+            FROM ocr_chunks c
+            JOIN ocr_documents d ON c.document_id = d.id
+            ORDER BY c.embedding <=> CAST(:embedding AS vector)
+            LIMIT :top_k
+        """)
+        params = {"embedding": str(query_embedding), "top_k": top_k}
+
+    try:
+        rows = db.execute(sql, params).fetchall()
+        return [
+            {
+                "chunk_id": row.id, "document_id": row.document_id,
+                "filename": row.filename, "s3_key": row.s3_key,
+                "page": row.page_number, "chunk_number": row.chunk_number,
+                "content": row.content, "distance": float(row.distance),
+            }
+            for row in rows
+        ]
+    except Exception as e:
+        logger.error("Semantic search with metadata failed: %s", e)
+        raise RuntimeError(f"Semantic search failed: {e}") from e
+</file>
+
+<file path="Backend/requirements.txt">
+fastapi==0.115.12
+uvicorn[standard]==0.34.2
+
+sqlalchemy==2.0.40
+psycopg2-binary==2.9.10
+pgvector==0.4.1
+
+python-dotenv==1.1.0
+python-multipart==0.0.20
+
+boto3==1.38.23
+botocore==1.38.23
+
+pillow==11.2.1
+pytesseract==0.3.13
+pdf2image==1.17.0
+
+sentence-transformers==4.1.0
+transformers==4.52.3
+torch==2.7.0
+
+langchain==0.3.25
+langchain-core==0.3.63
+langchain-groq==0.3.2
+
+numpy==2.2.6
+pydantic==2.11.5
+
+# NEW
+python-jose[cryptography]==3.3.0
+passlib[bcrypt]==1.7.4
+
+pytest==8.3.5
+httpx==0.28.1
+</file>
+
+<file path="frontend/src/App.jsx">
+import { useState } from "react";
+import { Toaster } from "react-hot-toast";
+import { AuthProvider, useAuth } from "./context/AuthContext";
+import Dashboard from "./pages/Dashboard";
+import LoginPage from "./pages/LoginPage";
+import RegisterPage from "./pages/RegisterPage";
+
+function AppContent() {
+  const { user, loading } = useAuth();
+  const [showRegister, setShowRegister] = useState(false);
+
+  if (loading) {
+    return (
+      <div className="min-h-screen bg-slate-950 flex items-center justify-center">
+        <div className="text-slate-400 text-lg animate-pulse">Loading...</div>
+      </div>
+    );
+  }
+
+  if (user) return <Dashboard />;
+
+  if (showRegister) return <RegisterPage onSwitchToLogin={() => setShowRegister(false)} />;
+
+  return <LoginPage onSwitchToRegister={() => setShowRegister(true)} />;
+}
+
+function App() {
+  return (
+    <AuthProvider>
+      <Toaster position="top-right" />
+      <AppContent />
+    </AuthProvider>
+  );
+}
+
+export default App;
+</file>
+
+<file path="frontend/src/components/Header.jsx">
+import { LogOut, User } from "lucide-react";
+import { useAuth } from "../context/AuthContext";
+import toast from "react-hot-toast";
+
+function Header() {
+  const { user, logout } = useAuth();
+
+  const handleLogout = () => {
+    logout();
+    toast.success("Logged out");
+  };
+
+  return (
+    <div className="bg-slate-900 border-b border-slate-800 px-6 py-4 flex items-center justify-between">
+
+      <div>
+        <h1 className="text-2xl font-bold">AI RAG Dashboard</h1>
+        <p className="text-slate-400 text-sm mt-1">Upload documents and ask AI questions</p>
+      </div>
+
+      {user && (
+        <div className="flex items-center gap-4">
+          <div className="flex items-center gap-2 text-sm text-slate-300">
+            <div className="w-8 h-8 rounded-full bg-blue-600 flex items-center justify-center">
+              <User size={16} />
+            </div>
+            <span className="hidden sm:block">{user.username}</span>
+          </div>
+          <button
+            onClick={handleLogout}
+            className="flex items-center gap-2 text-slate-400 hover:text-red-400 transition text-sm px-3 py-2 rounded-lg hover:bg-slate-800"
+          >
+            <LogOut size={16} />
+            <span className="hidden sm:block">Logout</span>
+          </button>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+export default Header;
+</file>
+
+<file path="frontend/src/services/api.js">
+import axios from "axios";
+
+const API = axios.create({
+  baseURL: import.meta.env.VITE_API_URL,
+});
+
+// Attach Bearer token to every request
+API.interceptors.request.use((config) => {
+  const token = localStorage.getItem("access_token");
+  if (token) config.headers.Authorization = `Bearer ${token}`;
+  return config;
+});
+
+// Auto-refresh on 401
+let isRefreshing = false;
+let failedQueue = [];
+
+const processQueue = (error, token = null) => {
+  failedQueue.forEach((p) => (error ? p.reject(error) : p.resolve(token)));
+  failedQueue = [];
+};
+
+API.interceptors.response.use(
+  (res) => res,
+  async (error) => {
+    const original = error.config;
+    if (error.response?.status === 401 && !original._retry) {
+      const refresh = localStorage.getItem("refresh_token");
+      if (!refresh) {
+        localStorage.removeItem("access_token");
+        window.location.href = "/";
+        return Promise.reject(error);
+      }
+      if (isRefreshing) {
+        return new Promise((resolve, reject) => failedQueue.push({ resolve, reject }))
+          .then((token) => { original.headers.Authorization = `Bearer ${token}`; return API(original); })
+          .catch((err) => Promise.reject(err));
+      }
+      original._retry = true;
+      isRefreshing = true;
+      try {
+        const res = await axios.post(`${import.meta.env.VITE_API_URL}/auth/refresh`, { refresh_token: refresh });
+        const newToken = res.data.access_token;
+        localStorage.setItem("access_token", newToken);
+        processQueue(null, newToken);
+        original.headers.Authorization = `Bearer ${newToken}`;
+        return API(original);
+      } catch (err) {
+        processQueue(err, null);
+        localStorage.removeItem("access_token");
+        localStorage.removeItem("refresh_token");
+        window.location.href = "/";
+        return Promise.reject(err);
+      } finally {
+        isRefreshing = false;
+      }
+    }
+    return Promise.reject(error);
+  }
+);
+
+export default API;
 </file>
 
 </files>
