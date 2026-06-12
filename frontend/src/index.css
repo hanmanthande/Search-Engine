@@ -2,20 +2,74 @@
 
 * {
   box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+:root {
+  --sidebar-width: 260px;
+  --bg: #f5f4f0;
+  --surface: #ffffff;
+  --surface-hover: #f0efe9;
+  --border: #e5e3db;
+  --border-strong: #ccc9bf;
+  --text-primary: #1a1917;
+  --text-secondary: #6b6963;
+  --text-muted: #9c9890;
+  --accent: #d97706;
+  --accent-light: #fef3c7;
+  --accent-hover: #b45309;
+  --danger: #dc2626;
+  --danger-light: #fef2f2;
+  --success: #16a34a;
+  --radius-sm: 6px;
+  --radius-md: 10px;
+  --radius-lg: 14px;
+  --shadow-sm: 0 1px 3px rgba(0,0,0,0.06), 0 1px 2px rgba(0,0,0,0.04);
 }
 
 body {
   margin: 0;
-  background: #020617;
-  color: white;
-  font-family: Inter, sans-serif;
+  background: var(--bg);
+  color: var(--text-primary);
+  font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', system-ui, sans-serif;
+  font-size: 15px;
+  line-height: 1.6;
+  -webkit-font-smoothing: antialiased;
 }
 
-::-webkit-scrollbar {
-  width: 6px;
-}
+::-webkit-scrollbar { width: 5px; height: 5px; }
+::-webkit-scrollbar-track { background: transparent; }
+::-webkit-scrollbar-thumb { background: var(--border-strong); border-radius: 10px; }
 
-::-webkit-scrollbar-thumb {
-  background: #334155;
-  border-radius: 10px;
+button { cursor: pointer; border: none; background: none; font-family: inherit; font-size: inherit; }
+input, textarea { font-family: inherit; font-size: inherit; }
+
+.prose h1, .prose h2, .prose h3 { font-weight: 600; margin: 1rem 0 0.5rem; }
+.prose p { margin-bottom: 0.75rem; }
+.prose ul, .prose ol { padding-left: 1.5rem; margin-bottom: 0.75rem; }
+.prose li { margin-bottom: 0.25rem; }
+.prose code {
+  background: var(--surface-hover);
+  padding: 2px 5px;
+  border-radius: 4px;
+  font-size: 0.875em;
+  font-family: 'SF Mono', 'Fira Code', monospace;
 }
+.prose pre {
+  background: var(--surface-hover);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-md);
+  padding: 1rem;
+  overflow-x: auto;
+  margin-bottom: 0.75rem;
+}
+.prose pre code { background: none; padding: 0; }
+.prose blockquote {
+  border-left: 3px solid var(--border-strong);
+  padding-left: 1rem;
+  color: var(--text-secondary);
+  margin: 0.75rem 0;
+}
+.prose strong { font-weight: 600; }
+.prose a { color: var(--accent-hover); text-decoration: underline; }
